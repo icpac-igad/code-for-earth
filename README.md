@@ -69,3 +69,7 @@ The working code for the challenge lives across two ICPAC repositories. Each bra
 
 - Challenge issue: [ECMWFCode4Earth/Challenges_2026 #16](https://github.com/ECMWFCode4Earth/Challenges_2026/issues/16)
 - ECMWF Code for Earth: https://codeforearth.ecmwf.int/
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
