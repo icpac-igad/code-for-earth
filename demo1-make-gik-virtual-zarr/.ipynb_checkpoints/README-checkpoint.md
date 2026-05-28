@@ -66,11 +66,6 @@ cd demo1-make-gik-virtual-zarr
 uv run demo1_make_par.py               # writes ./example.parquet
 ```
 
-> ⚠ Use `uv run demo1_make_par.py`, **not** `uv run python demo1_make_par.py`.
-> The `python` in the middle makes uv hand the script to whatever `python`
-> is on `PATH` (which may be a Coiled / conda env missing `pyarrow`) and
-> the PEP 723 metadata at the top of the script is silently ignored.
-
 Expected output (the streaming-vs-download magic in numbers):
 
 ```

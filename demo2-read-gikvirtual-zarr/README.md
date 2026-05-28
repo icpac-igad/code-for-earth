@@ -73,6 +73,12 @@ cd ../demo2-read-gikvirtual-zarr
 uv run demo2_read_par.py               # writes ./example.png
 ```
 
+> ⚠ Use `uv run demo2_read_par.py`, **not** `uv run python demo2_read_par.py`.
+> The `python` in the middle makes uv hand the script to whatever `python`
+> is on `PATH` (which may be a Coiled / conda env missing `gribberish` or
+> `pyarrow`) and the PEP 723 metadata at the top of the script is silently
+> ignored. Same applies to Demo 1.
+
 Expected output (the streaming win in one line):
 
 ```

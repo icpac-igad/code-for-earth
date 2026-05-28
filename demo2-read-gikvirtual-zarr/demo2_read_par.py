@@ -23,7 +23,12 @@ This is where the streaming win becomes visible:
     - Plot it with matplotlib and save example.png.
 
 Run:
-    uv run demo2_read_par.py            # uv handles the deps automatically
+    uv run demo2_read_par.py            # uv reads the inline metadata above
+                                        # and installs deps in an ephemeral env
+
+    NOT  `uv run python demo2_read_par.py`  — putting `python` between
+    `uv run` and the script name bypasses the inline metadata and uses
+    whatever `python` is on PATH, which may be missing pyarrow / gribberish.
 
 Production version (used by ICPAC's cGAN streamer + plot pipeline):
     https://github.com/icpac-igad/grib-index-kerchunk/blob/main/ecmwf/stream_cgan_variables.py
@@ -31,11 +36,22 @@ Production version (used by ICPAC's cGAN streamer + plot pipeline):
     members × 9 steps with a ThreadPoolExecutor.
 """
 from __future__ import annotations
+import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import requests
+try:
+    import numpy as np
+    import pandas as pd
+    import pyarrow  # noqa: F401  -- explicit so a missing parquet engine fails here
+    import requests
+except ImportError as e:
+    sys.exit(
+        f"\n!! {e.name} not importable.\n"
+        f"   Run this script with `uv run demo2_read_par.py` (no `python` in\n"
+        f"   between) so uv reads the PEP 723 metadata at the top and installs\n"
+        f"   the deps in an ephemeral env automatically.\n"
+        f"   If you cannot use uv, install manually:\n"
+        f"       pip install pandas pyarrow requests gribberish matplotlib numpy")
 
 # Where demo1 wrote its manifest:
 PAR = Path(__file__).resolve().parent.parent / "demo1-make-gik-virtual-zarr" / "example.parquet"

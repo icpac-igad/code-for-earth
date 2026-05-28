@@ -26,7 +26,12 @@ Idea:
     no eccodes/cfgrib needed for this step.
 
 Run:
-    uv run demo1_make_par.py            # uv handles the deps automatically
+    uv run demo1_make_par.py            # uv reads the inline metadata above
+                                        # and installs deps in an ephemeral env
+
+    NOT  `uv run python demo1_make_par.py`  — putting `python` between
+    `uv run` and the script name bypasses the inline metadata and uses
+    whatever `python` is on PATH, which may be missing pyarrow / requests.
 
 Output:
     ./example.parquet
@@ -39,10 +44,21 @@ Production version of this pattern (used by ICPAC's pipeline):
 """
 from __future__ import annotations
 import json
+import sys
 from pathlib import Path
 
-import pandas as pd
-import requests
+try:
+    import pandas as pd
+    import pyarrow  # noqa: F401  -- explicit so a missing parquet engine fails here
+    import requests
+except ImportError as e:
+    sys.exit(
+        f"\n!! {e.name} not importable.\n"
+        f"   Run this script with `uv run demo1_make_par.py` (no `python` in\n"
+        f"   between) so uv reads the PEP 723 metadata at the top and installs\n"
+        f"   pandas + pyarrow + requests in an ephemeral env automatically.\n"
+        f"   If you cannot use uv, install manually:\n"
+        f"       pip install pandas pyarrow requests")
 
 # ---- A tiny, reproducible worked example ----------------------------------
 # ECMWF Open Data on AWS retains the most recent ~30 days of real-time
