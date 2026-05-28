@@ -2,13 +2,44 @@
 
 **Weekly rhythm:** Week 2 · Component 1 (standardise & open the archive)
 
-A short, mentor-led demo. The full, self-contained tutorial and the production code live in the linked repositories — this folder only points you to them and frames the goal for the week.
+## The concepts
 
-## What the demo shows (quick, mentor side)
+**HTTP Range requests** are the foundation of cloud-native data access. Every
+object on S3 (and most HTTPS object stores) supports `Range: bytes=A-B` headers
+— ask for any contiguous byte slice of any object, the server returns HTTP `206
+Partial Content`. **Pay only for the bytes you ask for.** The GIK manifest from
+Demo 1 (`url`, `byte_offset`, `byte_length`) is exactly what you need to issue
+those requests against the cloud GRIB.
 
-- Take the GIK Parquet references from Demo 1 and standardise them to **Zarr v3 / IceChunk** (via VirtualiZarr).
-- Open the full archive with a **single `zarr.open()` / `xarray.open_dataset()`** call — metadata only, no data duplication.
-- Inspect dimensions (member, step, time, lat/lon) and lazily slice a variable over East Africa.
+**GRIB2 decoding without `eccodes`.** GRIB2 is a complex binary format and the
+classic decoder (`cfgrib`/`eccodes`) needs a system library that is painful to
+install. [`gribberish`](https://pypi.org/project/gribberish/) is a Rust+Python
+GRIB2 decoder that works on a raw byte buffer (no temp file, no system deps)
+and is ~80× faster than `cfgrib`. It is what makes byte-range-stream-and-decode
+fast enough to be practical in workers and notebooks.
+
+**Streaming vs downloading.** The standard "download the GRIB, then open it"
+workflow moves the whole 6+ GB file even if you only want one variable for one
+member. With a GIK manifest + Range request you move ~700 KB instead — roughly
+**10,000× less data**. The exact same pattern, parallelised, is what gives the
+production pipeline its cost and speed.
+
+**From one chunk to a virtual archive.** This demo fetches one GRIB message and
+plots it. The conceptual leap to the production pipeline is just doing the same
+thing for every (member, step, variable) lazily, behind a Zarr API — that is
+what **VirtualiZarr** + **IceChunk** add on top of the GIK manifest, so the
+user can `xarray.open_dataset(...)` the whole archive and slice it like any
+local dataset.
+
+## What the demo does
+
+- Reads `../demo1-make-gik-virtual-zarr/example.parquet` (the manifest).
+- Picks one row: 2 m air temperature for ensemble member 1 at step 0.
+- Sends ONE HTTP `Range` request for that ~670 KB GRIB message out of the
+  6.4 GB cloud GRIB.
+- Decodes the returned bytes with `gribberish` into a `(721, 1440)` float
+  array.
+- Plots a global temperature map and saves `example.png`.
 
 ## Self-contained tutorial & code
 
@@ -21,25 +52,25 @@ A short, mentor-led demo. The full, self-contained tutorial and the production c
 
 ## Where this fits
 
-The analysis-ready store opened here is the input that Demo 3 streams with Dask for exceedance analysis.
+The analysis-ready store opened here is the input that Demo 3 streams with
+Dask for exceedance analysis.
 
 ## Run locally (5 minutes, ~1 MB downloaded)
 
-A small self-contained script in this folder, **`demo2_read_par.py`**,
-consumes the GIK manifest produced by Demo 1 and uses it to stream ONE
-variable for ONE ensemble member out of the 6.4 GB source GRIB via a single
-HTTP `Range` request — then decodes and plots it.
+The script **`demo2_read_par.py`** is self-contained and uses
+[PEP 723 inline metadata](https://peps.python.org/pep-0723/), so
+[`uv`](https://docs.astral.sh/uv/) installs its dependencies (`pandas`,
+`pyarrow`, `requests`, `gribberish`, `matplotlib`, `numpy`) in an ephemeral
+environment automatically.
 
 ```bash
 # 1. Make the manifest in Demo 1 (must run first):
-cd ../demo1-make-gik-virtual-zarr
-pip install pandas pyarrow requests
-python demo1_make_par.py                   # writes ./example.parquet
+cd demo1-make-gik-virtual-zarr
+uv run demo1_make_par.py               # writes ./example.parquet
 
 # 2. Use the manifest here:
 cd ../demo2-read-gikvirtual-zarr
-pip install pandas pyarrow requests gribberish matplotlib numpy
-python demo2_read_par.py                   # writes ./example.png
+uv run demo2_read_par.py               # writes ./example.png
 ```
 
 Expected output (the streaming win in one line):
@@ -59,11 +90,11 @@ The script saves `example.png` — a global map of 2 m air temperature from
 ECMWF ensemble member 1.
 
 > The demo decodes one GRIB message at a time using
-> [`gribberish`](https://pypi.org/project/gribberish/) (Rust+Python, no
-> system `eccodes` needed) — the same decoder ICPAC's production streamer
-> uses to fan out across 12 vars × 51 members × 9 steps in
+> [`gribberish`](https://pypi.org/project/gribberish/) — the same decoder
+> ICPAC's production streamer uses to fan out across 12 vars × 51 members × 9
+> steps in
 > [`grib-index-kerchunk/ecmwf/stream_cgan_variables.py`](https://github.com/icpac-igad/grib-index-kerchunk/blob/main/ecmwf/stream_cgan_variables.py).
-> Going from "one variable, one member, plotted" (this demo) to
-> "lazy `zarr.open()` of the whole 51-member, 85-step archive via VirtualiZarr"
+> Going from "one variable, one member, plotted" (this demo) to "lazy
+> `zarr.open()` of the whole 51-member, 85-step archive via VirtualiZarr"
 > is the next conceptual step — that's what the production conversion
 > pipeline does.

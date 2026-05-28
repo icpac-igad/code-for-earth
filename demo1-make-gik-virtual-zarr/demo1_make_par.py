@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "pandas",
+#   "pyarrow",
+#   "requests",
+# ]
+# ///
 """
 demo1 — make a GIK manifest for ONE ECMWF IFS ensemble file.
 
@@ -18,8 +26,7 @@ Idea:
     no eccodes/cfgrib needed for this step.
 
 Run:
-    pip install pandas pyarrow requests
-    python demo1_make_par.py
+    uv run demo1_make_par.py            # uv handles the deps automatically
 
 Output:
     ./example.parquet
@@ -120,7 +127,7 @@ def main() -> int:
           f"{OUT.stat().st_size/1e3:.1f} KB local manifest.")
     print(f"  demo2 will use this manifest to byte-range-fetch ONE variable")
     print(f"  for ONE member (~1-2 MB) out of the full file. Run:")
-    print(f"     cd ../demo2-read-gikvirtual-zarr && python demo2_read_par.py")
+    print(f"     cd ../demo2-read-gikvirtual-zarr && uv run demo2_read_par.py")
     return 0
 
 

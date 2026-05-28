@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "pandas",
+#   "pyarrow",
+#   "requests",
+#   "gribberish",
+#   "matplotlib",
+#   "numpy",
+# ]
+# ///
 """
 demo2 — use the GIK manifest from demo1: byte-range-fetch ONE variable
         for ONE ensemble member, decode it, plot it.
@@ -12,8 +23,7 @@ This is where the streaming win becomes visible:
     - Plot it with matplotlib and save example.png.
 
 Run:
-    pip install pandas pyarrow requests gribberish matplotlib numpy
-    python demo2_read_par.py
+    uv run demo2_read_par.py            # uv handles the deps automatically
 
 Production version (used by ICPAC's cGAN streamer + plot pipeline):
     https://github.com/icpac-igad/grib-index-kerchunk/blob/main/ecmwf/stream_cgan_variables.py
@@ -43,7 +53,7 @@ def main() -> int:
         raise SystemExit(
             f"\n!! Manifest not found: {PAR}\n"
             f"   Run demo1 first:\n"
-            f"     cd ../demo1-make-gik-virtual-zarr && python demo1_make_par.py")
+            f"     cd ../demo1-make-gik-virtual-zarr && uv run demo1_make_par.py")
 
     df = pd.read_parquet(PAR)
     sel = df[(df["param"] == PICK_PARAM) & (df["number"] == PICK_NUMBER)]
@@ -90,7 +100,9 @@ def main() -> int:
     except ImportError:
         raise SystemExit(
             "\n!! gribberish not installed.\n"
-            "   pip install gribberish")
+            "   Easiest fix: re-run with `uv run demo2_read_par.py` (uv reads\n"
+            "   the inline PEP 723 metadata at the top of this script and\n"
+            "   installs the deps in an ephemeral env).")
     flat = gribberish.parse_grib_array(grib_bytes, 0)
     grid = np.asarray(flat).reshape(GRID).astype(np.float32)
     print(f"\nDecoded:      shape={grid.shape}  dtype={grid.dtype}  "
@@ -100,7 +112,9 @@ def main() -> int:
     try:
         import matplotlib.pyplot as plt
     except ImportError:
-        raise SystemExit("\n!! matplotlib not installed.  pip install matplotlib")
+        raise SystemExit(
+            "\n!! matplotlib not installed. Easiest fix: re-run with"
+            " `uv run demo2_read_par.py`.")
 
     data_c = grid - 273.15   # K -> degC for 2m temperature
     out_png = Path(__file__).with_name("example.png")
