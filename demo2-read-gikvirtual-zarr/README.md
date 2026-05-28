@@ -22,3 +22,48 @@ A short, mentor-led demo. The full, self-contained tutorial and the production c
 ## Where this fits
 
 The analysis-ready store opened here is the input that Demo 3 streams with Dask for exceedance analysis.
+
+## Run locally (5 minutes, ~1 MB downloaded)
+
+A small self-contained script in this folder, **`demo2_read_par.py`**,
+consumes the GIK manifest produced by Demo 1 and uses it to stream ONE
+variable for ONE ensemble member out of the 6.4 GB source GRIB via a single
+HTTP `Range` request — then decodes and plots it.
+
+```bash
+# 1. Make the manifest in Demo 1 (must run first):
+cd ../demo1-make-gik-virtual-zarr
+pip install pandas pyarrow requests
+python demo1_make_par.py                   # writes ./example.parquet
+
+# 2. Use the manifest here:
+cd ../demo2-read-gikvirtual-zarr
+pip install pandas pyarrow requests gribberish matplotlib numpy
+python demo2_read_par.py                   # writes ./example.png
+```
+
+Expected output (the streaming win in one line):
+
+```
+Picked:       param='2t'  number=1  levtype=sfc  step=0
+  byte slice: offset=476,193,115  length=669,009 bytes  (0.67 MB, 0.010% of the full file)
+GET           https://ecmwf-forecasts.s3.amazonaws.com/.../enfo-ef.grib2
+  Range: bytes=476193115-476862123
+  received 669,009 bytes  (HTTP 206 Partial Content)
+Total bytes you transferred to do this (manifest + chunk): 810,908 (0.81 MB)
+vs downloading the whole GRIB:                             6,396,517,751 (6.40 GB)
+  -> ratio: 7888x less data transferred.
+```
+
+The script saves `example.png` — a global map of 2 m air temperature from
+ECMWF ensemble member 1.
+
+> The demo decodes one GRIB message at a time using
+> [`gribberish`](https://pypi.org/project/gribberish/) (Rust+Python, no
+> system `eccodes` needed) — the same decoder ICPAC's production streamer
+> uses to fan out across 12 vars × 51 members × 9 steps in
+> [`grib-index-kerchunk/ecmwf/stream_cgan_variables.py`](https://github.com/icpac-igad/grib-index-kerchunk/blob/main/ecmwf/stream_cgan_variables.py).
+> Going from "one variable, one member, plotted" (this demo) to
+> "lazy `zarr.open()` of the whole 51-member, 85-step archive via VirtualiZarr"
+> is the next conceptual step — that's what the production conversion
+> pipeline does.
