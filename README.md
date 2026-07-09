@@ -33,6 +33,7 @@ To set a weekly coordination rhythm, each folder below holds a short **mentor-le
 | 3 | [`demo3-dask-data-stream`](demo3-dask-data-stream/) | Stream the archive with Dask; compute ensemble exceedance probabilities | 2 |
 | 4 | [`demo4-cmorph-return-period`](demo4-cmorph-return-period/) | Extreme value analysis: return-period thresholds from raw CMORPH | 2 |
 | 5 | [`demo5-calendar-web-app`](demo5-calendar-web-app/) | Calendar-map web app, storymaps, and admin-1 BN risk layer | 2 & 3 |
+| 6 | [`demo6-gik-ecmwf-ifs-icechunk-virtualdataset`](demo6-gik-ecmwf-ifs-icechunk-virtualdataset/) | Open the published ECMWF IFS Icechunk virtual dataset anonymously; read total precipitation for one forecast date | 1 |
 
 ## Key datasets
 
