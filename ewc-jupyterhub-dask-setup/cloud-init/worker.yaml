@@ -1,0 +1,157 @@
+#cloud-config
+# Dask worker for EWC. Private network only - no floating IP.
+#
+#   Flavor : 4cpu-16gbmem-40gbdisk
+#   Image  : Ubuntu-22.04
+#   SG     : dask-internal
+#
+# ${SCHEDULER_IP} is substituted at create time (Terraform templatefile() later).
+# NOTE for the Terraform port: escape the shell variables in start-worker.sh as
+# $${NPROCS} etc, or templatefile() will try to interpolate them and fail.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+  - bzip2
+  - xfsprogs
+
+write_files:
+  # ---------------------------------------------------------------------------
+  # MUST match the gateway's environment.yml for the shared packages. Dask fails
+  # confusingly on client/scheduler/worker version skew - the errors look like
+  # data corruption, not a version problem.
+  # ---------------------------------------------------------------------------
+  - path: /opt/dask/environment.yml
+    permissions: '0644'
+    content: |
+      name: dask
+      channels:
+        - conda-forge
+      dependencies:
+        # Python 3.12 is REQUIRED: zarr>=3.2 (needed by icechunk) does not
+        # build for 3.11 on conda-forge.
+        - python=3.12
+        - dask=2026.7.1
+        - distributed=2026.7.1
+        - numpy=2.5.1
+        - pandas=3.0.3
+        - xarray=2026.7.0
+        - zarr=3.2.1
+        - icechunk=2.1.1
+        - netcdf4=1.7.4
+        - h5netcdf=1.8.1
+        - cfgrib=0.9.15.1
+        - eccodes=2.48.0
+        - fsspec=2026.6.0
+        - s3fs=2026.6.0
+        - psutil=7.2.2
+        - bottleneck
+        - lz4
+        - blosc
+        - pip
+        - pip:
+            # Not packaged on conda-forge; Rust wheels from PyPI.
+            # Registers the "gribberish" Zarr v3 codec used by GIK stores.
+            - gribberish>=1.4
+
+  - path: /opt/dask/start-worker.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      NPROC=$(nproc)
+      TOTAL_MB=$(free -m | awk '/^Mem:/{print $2}')
+      WORKER_MB=$(( TOTAL_MB - 2048 ))          # leave ~2G for the OS
+
+      # ~4 threads per process keeps the GIL out of the way for numpy/xarray
+      # work while limiting per-process memory pressure.
+      NPROCS=$(( (NPROC + 3) / 4 ))
+      [ "$NPROCS" -lt 1 ] && NPROCS=1
+      NTHREADS=$(( NPROC / NPROCS ))
+      MEM_PER_PROC=$(( WORKER_MB / NPROCS ))
+
+      exec /opt/mamba/envs/dask/bin/dask worker \
+        "tcp://${SCHEDULER_IP}:8786" \
+        --nworkers "$NPROCS" \
+        --nthreads "$NTHREADS" \
+        --memory-limit "${MEM_PER_PROC}MB" \
+        --local-directory /scratch/dask \
+        --name "$(hostname)" \
+        --death-timeout 120
+
+  # S3 credentials for the EWC object store. Written post-boot, NOT baked into
+  # cloud-init user-data (which stays readable via the metadata service and the
+  # OpenStack API indefinitely). See RUNBOOK section 15.
+  #
+  # NOTE: any JupyterHub user can run arbitrary code on workers via
+  # client.run(), so this credential is effectively shared with all Hub users.
+  - path: /etc/dask/s3.env
+    permissions: '0600'
+    content: |
+      AWS_ENDPOINT_URL=https://object-store.os-api.<region>.ecmwf.int
+      AWS_DEFAULT_REGION=RegionOne
+      AWS_ACCESS_KEY_ID=REPLACE_ME
+      AWS_SECRET_ACCESS_KEY=REPLACE_ME
+
+  - path: /etc/systemd/system/dask-worker.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Dask worker
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=dask
+      Group=dask
+      EnvironmentFile=/etc/dask/s3.env
+      ExecStart=/opt/dask/start-worker.sh
+      # Workers must survive a scheduler restart; --death-timeout handles the
+      # give-up case, systemd handles the reconnect.
+      Restart=always
+      RestartSec=10
+      LimitNOFILE=65535
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - |
+    set -eux
+
+    # --- scratch for Dask spill ---------------------------------------------
+    # Spilling onto the root disk will fill it and wedge the VM. Use /dev/vdb
+    # when a volume is attached; fall back to the root disk so a test VM without
+    # one still boots.
+    if [ -b /dev/vdb ]; then
+      blkid /dev/vdb || mkfs.xfs -f /dev/vdb
+      mkdir -p /scratch
+      echo '/dev/vdb /scratch xfs defaults,nofail 0 2' >> /etc/fstab
+      mount /scratch
+    else
+      mkdir -p /scratch
+    fi
+
+    useradd --system --create-home --home-dir /var/lib/dask \
+      --shell /usr/sbin/nologin dask || true
+    mkdir -p /scratch/dask
+    chown -R dask:dask /scratch/dask
+
+    # --- micromamba ----------------------------------------------------------
+    export MAMBA_ROOT_PREFIX=/opt/mamba
+    install -d -m 0755 /opt/mamba
+    if [ ! -x /usr/local/bin/micromamba ]; then
+      curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+        | tar -xvj -C /tmp bin/micromamba
+      install -m 0755 /tmp/bin/micromamba /usr/local/bin/micromamba
+    fi
+    /usr/local/bin/micromamba create -y -p /opt/mamba/envs/dask -f /opt/dask/environment.yml
+
+    systemctl daemon-reload
+    systemctl enable --now dask-worker.service
+
+final_message: "dask worker bootstrap complete after $UPTIME s"

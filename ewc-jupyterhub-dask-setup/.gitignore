@@ -1,0 +1,12 @@
+# Nothing credential-bearing belongs in this folder.
+*.tfvars
+!terraform.tfvars.example
+terraform.tfstate
+terraform.tfstate.*
+.terraform/
+clouds*.yaml
+*.pem
+*.key
+*.json
+.env
+.env.*

@@ -1,0 +1,331 @@
+#cloud-config
+# JupyterHub gateway for EWC - serves ~15 users, later hosts the Dask scheduler.
+#
+#   Host   : hub-a.example.org  (Cloudflare, proxied)
+#   Flavor : 8cpu-32gbmem-80gbdisk
+#   Image  : Ubuntu-22.04
+#   Admin  : admin-username
+#
+# Environment is built with micromamba (single static binary, much faster solve
+# than conda) into /opt/mamba/envs/dask.
+#
+# TLS: nginx terminates using a Cloudflare Origin Certificate, Cloudflare SSL
+# mode "Full (strict)". A SELF-SIGNED placeholder is written at boot so nginx
+# can start before the real cert exists; Cloudflare returns error 526 until the
+# real origin cert replaces it.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+  - git
+  - bzip2
+  - nginx
+  - ssl-cert
+
+write_files:
+  # ---------------------------------------------------------------------------
+  # Pinned environment. The dask/distributed/numpy/pandas versions MUST match
+  # cloud-init-dask-worker.yaml exactly - Dask fails confusingly on version skew
+  # between client, scheduler and workers.
+  #
+  # JupyterHub 5.2 + nativeauthenticator 1.3 are a matched pair. Do NOT pair
+  # JupyterHub >=4.1 with nativeauthenticator 1.2 - the tightened XSRF check
+  # breaks signup with "XSRF cookie does not match POST argument".
+  # ---------------------------------------------------------------------------
+  - path: /opt/dask/environment.yml
+    permissions: '0644'
+    content: |
+      name: dask
+      channels:
+        - conda-forge
+      dependencies:
+        # Python 3.12 is REQUIRED: zarr>=3.2 (needed by icechunk) does not
+        # build for 3.11 on conda-forge.
+        - python=3.12
+        - dask=2026.7.1
+        - distributed=2026.7.1
+        - numpy=2.5.1
+        - pandas=3.0.3
+        - xarray=2026.7.0
+        - zarr=3.2.1
+        - icechunk=2.1.1
+        - netcdf4=1.7.4
+        - h5netcdf=1.8.1
+        - cfgrib=0.9.15.1
+        - eccodes=2.48.0
+        - fsspec=2026.6.0
+        - s3fs=2026.6.0
+        - psutil=7.2.2
+        - bottleneck
+        - lz4
+        - blosc
+        # --- gateway-only ---
+        - jupyterhub=5.2.1
+        - jupyterlab=4.2.5
+        - notebook
+        - configurable-http-proxy
+        - jupyter-resource-usage
+        - jupyter-server-proxy=4.4.0
+        - matplotlib
+        - cartopy
+        - pip
+        - pip:
+            # Not packaged on conda-forge; registers the "gribberish" Zarr v3
+            # codec used by GIK stores. MUST match the workers.
+            - gribberish>=1.4
+            - jupyterhub-nativeauthenticator==1.3.0
+            - jupyterhub-systemdspawner==1.0.1
+            - jupyterhub-idle-culler==1.4.0
+            # httpx >=0.28 removed the "proxies" kwarg, breaking extensions
+            # that still pass it (seen as a TypeError during spawn).
+            - httpx<0.28
+
+  - path: /srv/jupyterhub/jupyterhub_config.py
+    permissions: '0600'
+    content: |
+      import os
+      from nativeauthenticator import NativeAuthenticator
+
+      c = get_config()  # noqa: F821
+
+      # nginx terminates TLS; the Hub listens on loopback only.
+      c.JupyterHub.bind_url = 'http://127.0.0.1:8000'
+      c.JupyterHub.hub_bind_url = 'http://127.0.0.1:8081'
+
+      # --- authentication ----------------------------------------------------
+      c.JupyterHub.authenticator_class = NativeAuthenticator
+      c.NativeAuthenticator.open_signup = False       # admin approves each user
+      c.NativeAuthenticator.minimum_password_length = 12
+      c.NativeAuthenticator.check_common_password = True
+      c.NativeAuthenticator.allowed_failed_logins = 5
+      c.NativeAuthenticator.seconds_before_next_try = 300
+      c.Authenticator.admin_users = {'admin-username'}
+      c.Authenticator.allow_all = True                # JupyterHub 5 requires this
+
+      # Pre-authorised: NativeAuthenticator marks these authorised at signup, so
+      # no admin step. Anyone else queues at /hub/authorize. Lower case, exact.
+      c.Authenticator.allowed_users = {'alice', 'bob', 'carol'}
+
+      # public_url is REQUIRED behind nginx + configurable-http-proxy. Without
+      # it the Hub sees X-Forwarded-Proto "https,http" (nginx sets https, CHP
+      # appends http for its plain hop), reads the last value, concludes the
+      # request is insecure, and issues _xsrf cookies WITHOUT the Secure flag.
+      # Browsers then refuse to return them and every login/signup POST fails
+      # with "403 XSRF cookie does not match POST argument". The Hub logs
+      # "Skipping XSRF check for insecure request" when this is happening.
+      c.JupyterHub.public_url = 'https://hub-a.example.org'
+
+      # --- spawning ----------------------------------------------------------
+      # SystemdSpawner launches each user's server as its own systemd unit, so
+      # mem_limit/cpu_limit are ENFORCED via cgroups: a user who exceeds 8G gets
+      # a MemoryError in their own kernel instead of triggering an OOM kill that
+      # could take out another user's server or the Hub.
+      #
+      # NOTE: SystemdSpawner requires JupyterHub itself to run as root (it calls
+      # systemd-run). The user servers do NOT run as root - systemd drops them to
+      # unprivileged dynamic users. Do not add User= to jupyterhub.service.
+      c.JupyterHub.spawner_class = 'systemdspawner.SystemdSpawner'
+      c.Spawner.default_url = '/lab'
+      c.Spawner.cmd = ['/opt/mamba/envs/dask/bin/jupyterhub-singleuser']
+      # http_timeout (default 30s) is what produces "didn't respond in 30
+      # seconds" - a cold first JupyterLab launch can legitimately exceed it.
+      c.Spawner.start_timeout = 300
+      c.Spawner.http_timeout = 120
+
+      # Enforced by cgroups under SystemdSpawner.
+      c.SystemdSpawner.mem_limit = '8G'
+      c.SystemdSpawner.cpu_limit = 2.0
+
+      # dynamic_users lets systemd allocate a transient UID per user, so no
+      # system accounts are needed - which suits NativeAuthenticator, where
+      # users exist only in the Hub database. Homes persist under
+      # /var/lib/private/jupyterhub-singleuser/<username>.
+      c.SystemdSpawner.dynamic_users = True
+      c.SystemdSpawner.unit_name_template = 'jupyter-{USERNAME}'
+
+      # Per-user isolation: private /tmp, no device access, no sudo.
+      c.SystemdSpawner.isolate_tmp = True
+      c.SystemdSpawner.isolate_devices = True
+      c.SystemdSpawner.disable_user_sudo = True
+
+      # active_server_limit is the ACTUAL over-provisioning control: it caps
+      # concurrent running servers. 3 x 8G = 24G, leaving ~8G for the OS, nginx
+      # and the Dask scheduler. The 4th concurrent user is refused until someone
+      # logs out or is culled.
+      c.JupyterHub.shutdown_on_logout = True
+      c.JupyterHub.active_server_limit = 3
+
+      # --- idle culling -------------------------------------------------------
+      # Essential with a low active_server_limit: a user who closes the browser
+      # tab without logging out would otherwise hold a slot indefinitely.
+      # JupyterHub 2+ requires scopes via load_roles; the old "admin: True"
+      # on the service no longer grants them.
+      c.JupyterHub.services = [
+          {
+              'name': 'idle-culler',
+              'command': [
+                  '/opt/mamba/envs/dask/bin/python', '-m', 'jupyterhub_idle_culler',
+                  '--timeout=88800',       # ~24h: 1h culls unattended Dask work
+                  '--cull-every=300',
+              ],
+          },
+      ]
+      c.JupyterHub.load_roles = [
+          {
+              'name': 'idle-culler',
+              'services': ['idle-culler'],
+              'scopes': [
+                  'list:users', 'read:users:activity',
+                  'read:servers', 'delete:servers',
+              ],
+          },
+      ]
+
+      # --- Dask ---------------------------------------------------------------
+      # DASK_DISTRIBUTED__DASHBOARD__LINK makes the Client repr render a link
+      # routed through jupyter-server-proxy, so the dashboard is reached via the
+      # user's authenticated Hub session. Port 8787 is never publicly exposed.
+      c.Spawner.environment = {
+          'DASK_SCHEDULER_ADDRESS': os.environ.get(
+              'DASK_SCHEDULER_ADDRESS', 'tcp://127.0.0.1:8786'),
+          'DASK_DISTRIBUTED__DASHBOARD__LINK':
+              '/user/{JUPYTERHUB_USER}/proxy/8787/status',
+      }
+
+      # --- stale runtime dir cleanup ------------------------------------------
+      # With dynamic_users, systemd leaves /run/jupyter-<user> as a dangling
+      # symlink when a unit stops (logout, idle cull, Hub restart).
+      # SystemdSpawner's os.makedirs(exist_ok=True) still raises FileExistsError
+      # when the path exists but is not a directory, so every later spawn for
+      # that user 500s until it is cleared.
+      def _clear_stale_runtime_dir(spawner):
+          import os
+          import shutil
+          path = f"/run/jupyter-{spawner.user.name}"
+          try:
+              if os.path.islink(path) and not os.path.exists(path):
+                  os.unlink(path)
+                  spawner.log.info("cleared stale runtime symlink %s", path)
+              elif os.path.isdir(path) and not os.listdir(path):
+                  shutil.rmtree(path, ignore_errors=True)
+                  spawner.log.info("cleared stale runtime dir %s", path)
+          except OSError as e:
+              # Never block a spawn because cleanup failed.
+              spawner.log.warning("could not clear %s: %s", path, e)
+
+      c.Spawner.pre_spawn_hook = _clear_stale_runtime_dir
+
+      c.JupyterHub.db_url = 'sqlite:////srv/jupyterhub/jupyterhub.sqlite'
+      c.JupyterHub.cookie_secret_file = '/srv/jupyterhub/cookie_secret'
+
+  - path: /etc/systemd/system/jupyterhub.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=JupyterHub
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      # Runs as root ON PURPOSE: SystemdSpawner needs privilege to call
+      # systemd-run. Individual user servers are dropped to unprivileged
+      # dynamic users by systemd, so nothing user-facing runs as root.
+      WorkingDirectory=/srv/jupyterhub
+      Environment=PATH=/opt/mamba/envs/dask/bin:/usr/local/bin:/usr/bin:/bin
+      ExecStart=/opt/mamba/envs/dask/bin/jupyterhub -f /srv/jupyterhub/jupyterhub_config.py
+      Restart=always
+      RestartSec=10
+      LimitNOFILE=65535
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # nginx 1.18 on Ubuntu 22.04: "http2 on;" is nginx >= 1.25 syntax and will
+  # fail config test. HTTP/2 to the origin is unnecessary anyway - Cloudflare
+  # serves HTTP/2 and HTTP/3 to end users at the edge.
+  - path: /etc/nginx/sites-available/jupyterhub
+    permissions: '0644'
+    content: |
+      server {
+          listen 80 default_server;
+          server_name hub-a.example.org;
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+          listen 443 ssl;
+          server_name hub-a.example.org;
+
+          ssl_certificate     /etc/ssl/cloudflare/origin.pem;
+          ssl_certificate_key /etc/ssl/cloudflare/origin.key;
+          ssl_protocols TLSv1.2 TLSv1.3;
+
+          client_max_body_size 0;
+
+          location / {
+              proxy_pass http://127.0.0.1:8000;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              # JupyterLab needs websockets; without these the UI loads but
+              # kernels hang on a spinning indicator.
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+
+              proxy_read_timeout 86400;
+              proxy_buffering off;
+          }
+      }
+
+runcmd:
+  - |
+    set -eux
+
+    # User homes are managed by systemd under /var/lib/private when
+    # SystemdSpawner.dynamic_users is enabled, so no /srv/userhomes is needed.
+    install -d -m 0700 /srv/jupyterhub
+
+    # --- placeholder TLS so nginx starts before the origin cert is installed --
+    install -d -m 0755 /etc/ssl/cloudflare
+    if [ ! -f /etc/ssl/cloudflare/origin.pem ]; then
+      openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
+        -keyout /etc/ssl/cloudflare/origin.key \
+        -out    /etc/ssl/cloudflare/origin.pem \
+        -subj "/CN=hub-a.example.org"
+      chmod 600 /etc/ssl/cloudflare/origin.key
+    fi
+
+    # --- micromamba ----------------------------------------------------------
+    export MAMBA_ROOT_PREFIX=/opt/mamba
+    install -d -m 0755 /opt/mamba
+    if [ ! -x /usr/local/bin/micromamba ]; then
+      curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+        | tar -xvj -C /tmp bin/micromamba
+      install -m 0755 /tmp/bin/micromamba /usr/local/bin/micromamba
+    fi
+    /usr/local/bin/micromamba create -y -p /opt/mamba/envs/dask -f /opt/dask/environment.yml
+
+    # jupyter-server-proxy only proxies to localhost unless a host is allowed.
+    # <scheduler-private-ip> is the Dask scheduler (gateway 1) - needed so gateway 2's
+    # users can reach the dashboard. Harmless on gateway 1 itself.
+    install -d -m 0755 /opt/mamba/envs/dask/etc/jupyter
+    printf "c = get_config()  # noqa\nc.ServerProxy.host_allowlist = ['localhost', '127.0.0.1', '<scheduler-private-ip>']\n" \
+      > /opt/mamba/envs/dask/etc/jupyter/jupyter_server_config.py
+
+    # --- nginx ---------------------------------------------------------------
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf /etc/nginx/sites-available/jupyterhub /etc/nginx/sites-enabled/jupyterhub
+    nginx -t
+    systemctl reload nginx
+
+    # --- hub -----------------------------------------------------------------
+    systemctl daemon-reload
+    systemctl enable --now jupyterhub.service
+
+final_message: "jupyterhub gateway bootstrap complete after $UPTIME s"

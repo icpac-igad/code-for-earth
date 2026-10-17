@@ -1,0 +1,328 @@
+#cloud-config
+# JupyterHub gateway 2 - Terraform template.
+#
+# NOTE ON TEMPLATING: Terraform's templatefile() interpolates every $${...}.
+# Terraform variables appear as $${var} below; anything that must reach the VM
+# as a literal $${...} must be escaped as $$${...}. Single-brace {JUPYTERHUB_USER}
+# and bare $host (nginx) are untouched by templatefile and need no escaping.
+#
+# State lives on /dev/vdb, bind-mounted over the paths that must survive a
+# rebuild. The TLS private key therefore never appears in terraform state or in
+# cloud-init user-data (which stays readable via the metadata service).
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+  - bzip2
+  - nginx
+  - ssl-cert
+  - xfsprogs
+
+write_files:
+  - path: /opt/dask/environment.yml
+    permissions: '0644'
+    content: |
+      name: dask
+      channels:
+        - conda-forge
+      dependencies:
+        # Python 3.12 REQUIRED: zarr>=3.2 (needed by icechunk) has no 3.11 build.
+        - python=3.12
+        - dask=2026.7.1
+        - distributed=2026.7.1
+        - numpy=2.5.1
+        - pandas=3.0.3
+        - xarray=2026.7.0
+        - zarr=3.2.1
+        - icechunk=2.1.1
+        - netcdf4=1.7.4
+        - h5netcdf=1.8.1
+        - cfgrib=0.9.15.1
+        - eccodes=2.48.0
+        - fsspec=2026.6.0
+        - s3fs=2026.6.0
+        - psutil=7.2.2
+        - bottleneck
+        - lz4
+        - blosc
+        - jupyterhub=5.2.1
+        - jupyterlab=4.2.5
+        - notebook
+        - configurable-http-proxy
+        - jupyter-resource-usage
+        - jupyter-server-proxy=4.4.0
+        - matplotlib
+        - cartopy
+        - pip
+        - pip:
+            - gribberish>=1.4
+            - jupyterhub-nativeauthenticator==1.3.0
+            - jupyterhub-systemdspawner==1.0.1
+            - jupyterhub-idle-culler==1.4.0
+            - httpx<0.28
+
+  - path: /srv/jupyterhub_config.py.tmpl
+    permissions: '0600'
+    content: |
+      import os
+      from nativeauthenticator import NativeAuthenticator
+
+      c = get_config()  # noqa: F821
+
+      c.JupyterHub.bind_url = 'http://127.0.0.1:8000'
+      c.JupyterHub.hub_bind_url = 'http://127.0.0.1:8081'
+
+      # --- authentication ---
+      c.JupyterHub.authenticator_class = NativeAuthenticator
+      c.NativeAuthenticator.open_signup = False
+      c.NativeAuthenticator.minimum_password_length = 12
+      c.NativeAuthenticator.check_common_password = True
+      c.NativeAuthenticator.allowed_failed_logins = 5
+      c.NativeAuthenticator.seconds_before_next_try = 300
+      c.Authenticator.admin_users = {'${admin_user}'}
+      c.Authenticator.allow_all = True          # REQUIRED on JupyterHub 5
+
+      # REQUIRED behind nginx + configurable-http-proxy. Without it the Hub sees
+      # X-Forwarded-Proto "https,http" (nginx sets https, CHP appends http for
+      # its plain hop), reads the last value, decides the request is insecure,
+      # and issues _xsrf cookies WITHOUT the Secure flag. Browsers then refuse
+      # to return them and every login POST fails with
+      # "403 XSRF cookie does not match POST argument".
+      c.JupyterHub.public_url = 'https://${hostname}'
+
+      # Pre-authorised users: NativeAuthenticator marks these authorised at
+      # signup, so no admin approval step. Anyone else queues at /hub/authorize.
+      c.Authenticator.allowed_users = set(${allowed_users_json})
+
+      # --- spawning ---
+      # SystemdSpawner needs the Hub as root (it calls systemd-run); user
+      # servers are dropped to unprivileged dynamic users. Do NOT add User= to
+      # jupyterhub.service - JupyterLab refuses to run as root, which surfaces
+      # only as a spawn timeout.
+      c.JupyterHub.spawner_class = 'systemdspawner.SystemdSpawner'
+      c.Spawner.default_url = '/lab'
+      c.Spawner.cmd = ['/opt/mamba/envs/dask/bin/jupyterhub-singleuser']
+      c.Spawner.start_timeout = 300
+      c.Spawner.http_timeout = 120              # 30s default causes spurious failures
+
+      c.SystemdSpawner.mem_limit = '${mem_limit}'
+      c.SystemdSpawner.cpu_limit = 2.0
+      c.SystemdSpawner.dynamic_users = True
+      c.SystemdSpawner.unit_name_template = 'jupyter-{USERNAME}'
+      c.SystemdSpawner.isolate_tmp = True
+      c.SystemdSpawner.disable_user_sudo = True
+
+      c.JupyterHub.shutdown_on_logout = True
+      c.JupyterHub.active_server_limit = ${concurrent_users}
+
+      # --- idle culling ---
+      c.JupyterHub.services = [
+          {
+              'name': 'idle-culler',
+              'command': [
+                  '/opt/mamba/envs/dask/bin/python', '-m', 'jupyterhub_idle_culler',
+                  '--timeout=${cull_timeout}', '--cull-every=300',
+              ],
+          },
+      ]
+      # JupyterHub 2+ needs explicit scopes; "admin: True" grants nothing.
+      c.JupyterHub.load_roles = [
+          {
+              'name': 'idle-culler',
+              'services': ['idle-culler'],
+              'scopes': ['list:users', 'read:users:activity',
+                         'read:servers', 'delete:servers'],
+          },
+      ]
+
+      # --- environment ---
+      # PATH: without it a JupyterLab terminal gets Ubuntu's system python3
+      # (no numpy) while kernels use the shared env.
+      c.Spawner.environment = {
+          'PATH': '/opt/mamba/envs/dask/bin:/usr/local/bin:/usr/bin:/bin',
+          'DASK_SCHEDULER_ADDRESS': '${scheduler_address}',
+          'DASK_DISTRIBUTED__DASHBOARD__LINK':
+              '/user/{JUPYTERHUB_USER}/proxy/<scheduler-private-ip>:8787/status',
+      }
+
+      # --- stale runtime dir cleanup ---
+      # dynamic_users leaves a dangling /run/jupyter-<user> symlink when a unit
+      # stops (logout, idle cull, Hub restart). SystemdSpawner's
+      # os.makedirs(exist_ok=True) still raises FileExistsError when the path
+      # exists but is not a directory, so later spawns 500 until it is cleared.
+      def _clear_stale_runtime_dir(spawner):
+          import os
+          import shutil
+          path = f"/run/jupyter-{spawner.user.name}"
+          try:
+              if os.path.islink(path) and not os.path.exists(path):
+                  os.unlink(path)
+                  spawner.log.info("cleared stale runtime symlink %s", path)
+              elif os.path.isdir(path) and not os.listdir(path):
+                  shutil.rmtree(path, ignore_errors=True)
+                  spawner.log.info("cleared stale runtime dir %s", path)
+          except OSError as e:
+              spawner.log.warning("could not clear %s: %s", path, e)
+
+      c.Spawner.pre_spawn_hook = _clear_stale_runtime_dir
+
+      c.JupyterHub.db_url = 'sqlite:////srv/jupyterhub/jupyterhub.sqlite'
+      c.JupyterHub.cookie_secret_file = '/srv/jupyterhub/cookie_secret'
+
+  - path: /etc/systemd/system/jupyterhub.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=JupyterHub
+      After=network-online.target srv-jupyterhub.mount
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      # Root ON PURPOSE: SystemdSpawner calls systemd-run. User servers are
+      # dropped to unprivileged dynamic users by systemd.
+      WorkingDirectory=/srv/jupyterhub
+      Environment=PATH=/opt/mamba/envs/dask/bin:/usr/local/bin:/usr/bin:/bin
+      ExecStart=/opt/mamba/envs/dask/bin/jupyterhub -f /srv/jupyterhub/jupyterhub_config.py
+      Restart=always
+      RestartSec=10
+      LimitNOFILE=65535
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # nginx 1.18 (Ubuntu 22.04) rejects "http2 on;" - that is nginx >= 1.25.
+  # HTTP/2 to the origin is unnecessary: Cloudflare serves it at the edge.
+  - path: /etc/nginx/sites-available/jupyterhub
+    permissions: '0644'
+    content: |
+      server {
+          listen 80 default_server;
+          server_name ${hostname};
+          return 301 https://$host$request_uri;
+      }
+
+      server {
+          listen 443 ssl;
+          server_name ${hostname};
+
+          ssl_certificate     /etc/ssl/cloudflare/origin.pem;
+          ssl_certificate_key /etc/ssl/cloudflare/origin.key;
+          ssl_protocols TLSv1.2 TLSv1.3;
+
+          client_max_body_size 0;
+
+          location / {
+              proxy_pass http://127.0.0.1:8000;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              # JupyterLab needs websockets, or the UI loads but kernels hang.
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+
+              proxy_read_timeout 86400;
+              proxy_buffering off;
+          }
+      }
+
+runcmd:
+  - |
+    set -eux
+
+    # --- persistent state volume ---------------------------------------------
+    # First boot formats it; later boots reuse it, so TLS cert, user accounts
+    # and notebooks survive VM replacement.
+    #
+    # Two traps here, both of which silently put state on the ROOT disk - the
+    # failure is invisible until the next rebuild destroys everything:
+    #
+    #  1. RACE. Terraform attaches the volume only after the instance is
+    #     ACTIVE, so it may not exist yet when this runs. Wait up to 120s.
+    #  2. DEVICE NAME. The "device = /dev/vdb" in Terraform is a hint OpenStack
+    #     is free to ignore; on this tenancy disks appear as sda/sdb. Detect
+    #     the non-root disk instead of assuming a name.
+    STATE_DEV=""
+    for _ in $(seq 1 60); do
+      ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" 2>/dev/null | head -1)
+      STATE_DEV=$(lsblk -rno NAME,TYPE | awk '$2=="disk"{print $1}' \
+                  | grep -vx "$ROOT_DISK" | head -1)
+      [ -n "$STATE_DEV" ] && break
+      sleep 2
+    done
+
+    if [ -n "$STATE_DEV" ] && [ -b "/dev/$STATE_DEV" ]; then
+      blkid "/dev/$STATE_DEV" || mkfs.xfs -f "/dev/$STATE_DEV"
+      mkdir -p /srv/state
+      # Mount by UUID: device names are not stable across reboots or rebuilds.
+      UUID=$(blkid -s UUID -o value "/dev/$STATE_DEV")
+      grep -q "$UUID" /etc/fstab || \
+        echo "UUID=$UUID /srv/state xfs defaults,nofail 0 2" >> /etc/fstab
+      mount /srv/state
+      echo "state volume /dev/$STATE_DEV mounted on /srv/state"
+    else
+      echo "WARNING: no state volume found - state will NOT survive a rebuild"
+      mkdir -p /srv/state
+    fi
+
+    mkdir -p /srv/state/ssl/cloudflare /srv/state/jupyterhub /srv/state/userhomes
+    chmod 700 /srv/state/jupyterhub
+
+    # Bind-mount state into the paths the software expects.
+    mkdir -p /etc/ssl/cloudflare /srv/jupyterhub /var/lib/private/jupyterhub-singleuser
+    for pair in \
+      "/srv/state/ssl/cloudflare /etc/ssl/cloudflare" \
+      "/srv/state/jupyterhub /srv/jupyterhub" \
+      "/srv/state/userhomes /var/lib/private/jupyterhub-singleuser"; do
+      src=$(echo $pair | cut -d' ' -f1)
+      dst=$(echo $pair | cut -d' ' -f2)
+      grep -q "$dst none bind" /etc/fstab || echo "$src $dst none bind 0 0" >> /etc/fstab
+      mountpoint -q "$dst" || mount --bind "$src" "$dst"
+    done
+
+    # Config is regenerated each boot from the template, so Terraform variable
+    # changes take effect; the database beside it persists on the volume.
+    install -m 0600 /srv/jupyterhub_config.py.tmpl /srv/jupyterhub/jupyterhub_config.py
+
+    # --- TLS ------------------------------------------------------------------
+    # Placeholder only if the volume has no real cert yet. Cloudflare returns
+    # error 526 under Full (strict) until the origin cert is installed.
+    if [ ! -s /etc/ssl/cloudflare/origin.pem ]; then
+      openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
+        -keyout /etc/ssl/cloudflare/origin.key \
+        -out    /etc/ssl/cloudflare/origin.pem \
+        -subj "/CN=${hostname}"
+      chmod 600 /etc/ssl/cloudflare/origin.key
+    fi
+
+    # --- micromamba (much faster than conda: 127s vs 421s) --------------------
+    export MAMBA_ROOT_PREFIX=/opt/mamba
+    install -d -m 0755 /opt/mamba
+    if [ ! -x /usr/local/bin/micromamba ]; then
+      curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+        | tar -xvj -C /tmp bin/micromamba
+      install -m 0755 /tmp/bin/micromamba /usr/local/bin/micromamba
+    fi
+    /usr/local/bin/micromamba create -y -p /opt/mamba/envs/dask -f /opt/dask/environment.yml
+
+    # jupyter-server-proxy only proxies to localhost unless a host is allowed;
+    # the Dask dashboard lives on gateway 1.
+    install -d -m 0755 /opt/mamba/envs/dask/etc/jupyter
+    printf "c = get_config()\nc.ServerProxy.host_allowlist = ['localhost', '127.0.0.1', '<scheduler-private-ip>']\n" \
+      > /opt/mamba/envs/dask/etc/jupyter/jupyter_server_config.py
+
+    # --- nginx ---------------------------------------------------------------
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf /etc/nginx/sites-available/jupyterhub /etc/nginx/sites-enabled/jupyterhub
+    nginx -t
+    systemctl reload nginx
+
+    systemctl daemon-reload
+    systemctl enable --now jupyterhub.service
+
+final_message: "jupyterhub gateway 2 bootstrap complete after $UPTIME s"

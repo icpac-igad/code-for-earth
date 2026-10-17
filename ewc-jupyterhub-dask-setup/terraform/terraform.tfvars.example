@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (git-ignored) and fill in.
+# Token: Zone:DNS:Edit, scoped to this zone only. NEVER the Global API Key.
+cf_api_token = "your-cloudflare-api-token"
+
+# Optional overrides:
+# gw2_subdomain        = "hub-b"
+# gw2_mem_limit        = "4G"
+# gw2_concurrent_users = 7
